@@ -12,7 +12,7 @@ Here's a blank template to get started: To avoid retyping too much info. Do a se
 
 ### Built With
 
-* [neo4j][neo4j-url]
+* [neo4j[neo4j-url]]
 
 <!-- GETTING STARTED -->
 ## Getting Started
@@ -24,7 +24,8 @@ To get a local copy up and running follow these simple example steps.
 
 This is an example of how to list things you need to use the software and how to install them.
 * docker-compose
-  ```sh
+
+```sh
  docker-compose up -d --build
   ```
 
