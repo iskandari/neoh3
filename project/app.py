@@ -187,31 +187,29 @@ with tab2:
    
 
     form = st.form(key='my-form')
-    from_hex = form.text_input('Enter origin hex id')
-    to_hex = form.text_input('Enter destination hex id')
+    from_hex = form.text_input('Enter origin hex id', value='833849fffffffff')
+    to_hex = form.text_input('Enter destination hex id', value='83318dfffffffff')
     submit = form.form_submit_button('Submit')
 
     if submit:
 
         try: 
-            mylist = shortest_path(f'{from_hex}', f'{to_hex}')
+            res = shortest_path(f'{from_hex}', f'{to_hex}')
 
             # #df = pd.DataFrame(res)
             # # df.to_csv('shortest_path_dijkstra.csv', index=False)
 
-            res = pd.DataFrame(list(mylist[0][0]), columns=["hex_id"])
-
-            if not res.empty:
+            if res:
 
                 test = hexagons_dataframe_to_geojson(res, file_output=None, column_name="hex_id")
-                p = folium.Map(location=[40.70, -73.94], zoom_start=2, tiles="CartoDB positron")
+                p = folium.Map(location=[15, 80], zoom_start=3, tiles="CartoDB positron")
                 geo_j = folium.GeoJson(data=test, style_function=lambda x: {"fillColor": "orange"})
                 geo_j.add_to(p)
 
                 st_data = folium_static(p)
                 
                 st.write('Shortest path (H3 list)')
-                st.write(mylist[0][0])
+                st.write(res)
                 st.write(st_data)
 
         except:
