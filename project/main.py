@@ -127,7 +127,7 @@ def prepare_hexes():
 
         try:
             sess.run(query_string)
-            logging.info('Graph created')
+            logging.info('Creating graph')
         except Exception as e:
             logging.info(e)
 

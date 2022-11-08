@@ -92,6 +92,33 @@ def hexagons_dataframe_to_geojson(df_hex, file_output=None, column_name="value")
 uri = "neo4j://neo4j:7687"
 driver = GraphDatabase.driver(uri, auth=("neo4j", "password"))
 
+with driver.session() as sess:
+    
+    query_string = f"""
+    CALL gds.graph.project(
+    'myGraph',
+    'H3',
+    'CAN_PASS',
+    {{
+        relationshipProperties: 'cost'
+    }}
+    )
+    """
+
+    try:
+        sess.run(query_string)
+        res = sess.run(query_string)        
+    
+        if 'already exists' in res:
+            logging.info('myGraph exists')
+        else:
+            'graph created !'
+        
+    except Exception as e:
+        if e.__class__.__name__ == 'ClientError':
+            logging.info=("Graph already exists, skipping creation.")
+        
+
 
 def shortest_path(from_hex, to_hex):
 
@@ -123,25 +150,23 @@ from_hex = form.text_input('Enter origin hex id')
 to_hex = form.text_input('Enter destination hex id')
 submit = form.form_submit_button('Submit')
 
-
 if submit:
-    st.write(f'Calculating path...')
+    with st.spinner('Calculating path'):
 
+        mylist = shortest_path(f'{from_hex}', f'{to_hex}')
 
-    mylist = shortest_path(f'{from_hex}', f'{to_hex}')
+        # #df = pd.DataFrame(res)
+        # # df.to_csv('shortest_path_dijkstra.csv', index=False)
 
-    # #df = pd.DataFrame(res)
-    # # df.to_csv('shortest_path_dijkstra.csv', index=False)
+        res = pd.DataFrame(list(mylist[0][0]), columns=["hex_id"])
 
-    res = pd.DataFrame(list(mylist[0][0]), columns=["hex_id"])
+        st.write(res)
 
-    st.write(res)
+        test = hexagons_dataframe_to_geojson(res, file_output=None, column_name="hex_id")
+        m = folium.Map(location=[40.70, -73.94], zoom_start=2, tiles="CartoDB positron")
+        geo_j = folium.GeoJson(data=test, style_function=lambda x: {"fillColor": "orange"})
+        geo_j.add_to(m)
 
-    # test = hexagons_dataframe_to_geojson(res, file_output=None, column_name="hex_id")
-    # m = folium.Map(location=[40.70, -73.94], zoom_start=2, tiles="CartoDB positron")
-    # geo_j = folium.GeoJson(data=test, style_function=lambda x: {"fillColor": "orange"})
-    # geo_j.add_to(m)
+        st_data = st_folium(m, width=725)
 
-    # st_data = st_folium(m, width=725)
-
-    driver.close()
+        driver.close()
