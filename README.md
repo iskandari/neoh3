@@ -12,7 +12,7 @@ Here's a blank template to get started: To avoid retyping too much info. Do a se
 
 ### Built With
 
-* neo4j[neo4j-url]
+* neo4j[https://neo4j.com/]
 
 <!-- GETTING STARTED -->
 ## Getting Started
@@ -68,6 +68,3 @@ Project Link: [https://github.com/github_username/repo_name](https://github.com/
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-
-[neo4j]: https://dist.neo4j.com/wp-content/uploads/20210423072428/neo4j-logo-2020-1.svg
-[neo4j-url]: https://neo4j.com/
