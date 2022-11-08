@@ -13,9 +13,6 @@ Here's a blank template to get started: To avoid retyping too much info. Do a se
 
 ### Installation
 
-This is an example of how to list things you need to use the software and how to install them.
-* docker-compose
-
 ```sh
  docker-compose up -d --build
   ```
