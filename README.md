@@ -12,7 +12,7 @@ Here's a blank template to get started: To avoid retyping too much info. Do a se
 
 ### Built With
 
-* [![neo4j][neo4j]][neo4j-url]
+* [neo4j][neo4j-url]
 
 <!-- GETTING STARTED -->
 ## Getting Started
