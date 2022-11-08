@@ -7,6 +7,7 @@ Here's a blank template to get started: To avoid retyping too much info. Do a se
 ### Built With
 
 * [neo4j](https://neo4j.com/)
+* [streamlit](https://docs.streamlit.io/)
 
 <!-- GETTING STARTED -->
 
