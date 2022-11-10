@@ -25,7 +25,7 @@ However, few open-source maritime routing engines exist. The most notable is Eur
 
 To view the nodes and their edges use the neo4j interface http://localhost:7474/.
 
-Build an example path between two hexagaons in the basic streamlit app, hosted on http://localhost:7474/
+Build an example shortest path between two hexagaons using the Dijkstra's algorithm  in streamlit, hosted on http://localhost:7474/
 
 
 <!-- LICENSE -->
