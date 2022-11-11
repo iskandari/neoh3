@@ -7,7 +7,7 @@ This project grew out of the need to interpolate spatial gaps in [AIS data](http
 However, few open-source maritime routing engines exist. The most notable is Eurostat's Java-based application [SeaRoute](https://github.com/eurostat/searoute), which helped inspire this project.  Our idea was to develop an application that was on one hand understandable and visually engaging, and on the other hand modern and containerized.  We combined [H3](https://github.com/uber/h3) - a heirarchical geospatial indexing system - with the power of [neo4j](https://github.com/neo4j), a graph database, and visualize results using [streamlit](https://github.com/streamlit/streamlit).
 
 
-![Shortest H3 path](images/map.png){height=50% width=50%}
+![Shortest H3 path](images/map.png)
 
 ### Built With
 
