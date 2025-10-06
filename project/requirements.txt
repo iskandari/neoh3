@@ -7,3 +7,6 @@ geojson
 pandas
 folium
 streamlit-folium
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+scipy>=1.11

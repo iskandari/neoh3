@@ -1,218 +1,335 @@
-from os import ST_WRITE
-from neo4j import __version__ as neo4j_version
-import streamlit as st
-from streamlit_folium import st_folium
-from streamlit_folium import folium_static 
-
-print(neo4j_version)
-import pandas as pd
-import h3
-from shapely.geometry import Polygon, LineString
-import json
-from geojson import Feature, Point, FeatureCollection
+import os
+import math
+from typing import List, Optional
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, confloat, conint
 from neo4j import GraphDatabase
-import folium
-import geopandas as gpd
+from neo4j.exceptions import ServiceUnavailable
+from math import radians, cos, sin, asin, sqrt
+import h3
+
+
 import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("h3-api")
 
+def densify_polyline_m(poly: np.ndarray, max_step_m: float = 5.0) -> np.ndarray:
+    if len(poly) < 2:
+        return poly
+    out = [poly[0]]
+    for i in range(len(poly)-1):
+        a = poly[i]; b = poly[i+1]
+        seg_len = haversine_m(tuple(a), tuple(b))
+        if seg_len <= max_step_m:
+            out.append(b); continue
+        n = int(np.ceil(seg_len / max_step_m))
+        for t in np.linspace(0, 1, n+1)[1:]:
+            out.append(a*(1-t) + b*t)
+    return np.vstack(out)
 
-st.title("Shortest H3 maritime path ")
+def haversine_m(p1, p2):
+    # p = (lon,lat)
+    lon1, lat1 = map(radians, p1)
+    lon2, lat2 = map(radians, p2)
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    return 6371000.0 * 2 * asin(sqrt(a))  # meters
 
-
-class Neo4jConnection:
-    def __init__(self, uri, user, pwd):
-        self.__uri = uri
-        self.__user = user
-        self.__pwd = pwd
-        self.__driver = None
-        try:
-            self.__driver = GraphDatabase.driver(
-                self.__uri, auth=(self.__user, self.__pwd)
-            )
-        except Exception as e:
-            print("Failed to create the driver:", e)
-
-    def close(self):
-        if self.__driver is not None:
-            self.__driver.close()
-
-    def query(self, query, db=None):
-        assert self.__driver is not None, "Driver not initialized!"
-        session = None
-        response = None
-        try:
-            session = (
-                self.__driver.session(database=db)
-                if db is not None
-                else self.__driver.session()
-            )
-            response = list(session.run(query))
-        except Exception as e:
-            print("Query failed:", e)
-        finally:
-            if session is not None:
-                session.close()
-        return response
-
-
-def hexagons_dataframe_to_geojson(hex_list: list, column_name = "value"):
-    """
-    Produce the GeoJSON for a dataframe, constructing the geometry from the "hex_id" column
-    and with a property matching the one in column_name
-    """    
-    foo=  LineString([(-90, 179), (90, 179)])
-    bar = LineString([(-90, -179), (90, -179)])
-
-    list_features = []
-    
-    for hex_id in hex_list:
-        
-        h3.h3_to_geo_boundary(hex_id)
-        
-        try:
-            geometry_for_row = { "type" : "Polygon", "coordinates": [h3.h3_to_geo_boundary(hex_id,geo_json=True)]}
-            poly = Polygon(h3.h3_to_geo_boundary(hex_id))
-            if not foo.intersects(poly) and not bar.intersects(poly):
-                feature = Feature(geometry = geometry_for_row , id=hex_id, properties = {column_name : hex_id})
-                list_features.append(feature)
-            else:
-                print('intersected prime meridian!')
-        except:
-            print("An exception occurred for hex " + hex_id) 
-
-    feat_collection = FeatureCollection(list_features)
-    geojson_result = json.dumps(feat_collection)
-    return geojson_result
-
-
-uri = "neo4j://neo4j:7687"
-driver = GraphDatabase.driver(uri, auth=("neo4j", "password"))
-
-with driver.session() as sess:
-    
-    query_string = f"""
-    CALL gds.graph.project(
-    'myGraph',
-    'H3',
-    'CAN_PASS',
-    {{
-        relationshipProperties: 'cost'
-    }}
-    )
-    """
-
-    try:
-        sess.run(query_string)
-        res = sess.run(query_string)        
-    
-        if 'already exists' in res:
-            logging.info('myGraph exists')
-        else:
-            'graph created !'
-        
-    except Exception as e:
-        if e.__class__.__name__ == 'ClientError':
-            logging.info=("Graph already exists, skipping creation.")
-        
-
-
-def shortest_path(from_hex, to_hex):
-
-    with driver.session() as sess:
-        query_string = f"""
-
-        MATCH (source:H3 {{hex_name: '{from_hex}'}}), (target:H3 {{hex_name: '{to_hex}'}})
-        CALL gds.shortestPath.dijkstra.stream('myGraph', {{
-        nodeLabels:['H3'],
-        relationshipTypes:['CAN_PASS'],
-        relationshipWeightProperty: 'cost',
-        sourceNode:source,
-        targetNode:target}})
-        YIELD path, nodeIds
-        RETURN
-        [nodeId IN nodeIds | gds.util.asNode(nodeId).hex_name] AS nodeNames,
-        nodes(path) as path;
-        
-        """
-        res = sess.run(query_string)
-        res = [record for record in res]
-        return res[0][0] 
-
-example = pd.read_csv('data/example_path.csv')
-example_dict = example.to_dict(orient='records')
-
-missing_hexes = []
-valid_path = []
-
-for pos in example_dict:
-    if 'prev' not in locals(): 
-        prev = h3.geo_to_h3(pos['latitude'], pos['longitude'], 3)
-        valid_path.append(prev)
+def closest_point_on_segment(a, b, p):
+    # all as (lon,lat); use local equirectangular for small spans
+    # project to x/y meters around p's latitude
+    R = 6371000.0
+    lat0 = radians(p[1])
+    def to_xy(q):
+        lon, lat = map(radians, q)
+        x = R * (lon - radians(p[0])) * cos(lat0)
+        y = R * (lat - radians(p[1]))
+        return np.array([x, y])
+    A, B, P = map(to_xy, (a, b, p))
+    AB = B - A
+    if np.allclose(AB, 0):
+        t = 0.0
+        Q = A
     else:
-        
-        if not h3.h3_indexes_are_neighbors(prev, h3.geo_to_h3(pos['latitude'], pos['longitude'], 3)) \
-            and not (prev == h3.geo_to_h3(pos['latitude'], pos['longitude'], 3)):
-             
-            path = shortest_path(prev, h3.geo_to_h3(pos['latitude'], pos['longitude'], 3))
-            missing_hexes.extend(path)
-        
-        if not (prev == h3.geo_to_h3(pos['latitude'], pos['longitude'], 3)) \
-            and h3.h3_indexes_are_neighbors(prev, h3.geo_to_h3(pos['latitude'], pos['longitude'], 3)):
-            
-                valid_path.append(h3.geo_to_h3(pos['latitude'], pos['longitude'], 3))
-        
-        prev = h3.geo_to_h3(pos['latitude'], pos['longitude'], 3)
+        t = np.clip(np.dot(P - A, AB) / np.dot(AB, AB), 0.0, 1.0)
+        Q = A + t * AB
+    # back to lon/lat
+    xq, yq = Q
+    lon = p[0] + (xq / (R * cos(lat0)))
+    lat = p[1] + (yq / R)
+    return (lon, lat)
+
+def nearest_point_on_polyline(poly, p):
+    # poly: Nx2 (lon,lat), p: (lon,lat)
+    best_q, best_d = None, float("inf")
+    for i in range(len(poly)-1):
+        q = closest_point_on_segment(tuple(poly[i]), tuple(poly[i+1]), p)
+        d = haversine_m(q, p)
+        if d < best_d:
+            best_q, best_d = q, d
+    return best_q, best_d
+
+def cap_deviation(smoothed: np.ndarray, raw: np.ndarray, max_dev_m: float) -> np.ndarray:
+    if max_dev_m is None or max_dev_m <= 0:
+        return smoothed
+    out = smoothed.copy()
+    # lock endpoints
+    out[0]  = raw[0]
+    out[-1] = raw[-1]
+    for i in range(1, len(out)-1):
+        p = tuple(out[i])
+        q, d = nearest_point_on_polyline(raw, p)
+        if d > max_dev_m:
+            # move p toward q so the distance equals max_dev_m
+            # linear blend in lon/lat (ok for small steps)
+            alpha = (d - max_dev_m) / d
+            out[i] = ( (1 - alpha)*p[0] + alpha*q[0],
+                       (1 - alpha)*p[1] + alpha*q[1] )
+    return out
+
+def equirect_m2(p, q, lat0_rad=None):
+    # fast approx squared distance in meters^2 (good for small deltas)
+    R = 6371000.0
+    lon1, lat1 = map(radians, p)
+    lon2, lat2 = map(radians, q)
+    if lat0_rad is None:
+        lat0_rad = 0.5*(lat1+lat2)
+    dx = (lon2 - lon1) * cos(lat0_rad) * R
+    dy = (lat2 - lat1) * R
+    return dx*dx + dy*dy
+
+def closest_point_on_segment_fast(a, b, p):
+    # all (lon,lat); local equirectangular around p
+    R = 6371000.0
+    lat0 = radians(p[1])
+    def to_xy(q):
+        lon, lat = map(radians, q)
+        return np.array([R*(lon - radians(p[0]))*cos(lat0), R*(lat - radians(p[1]))])
+    A, B, P = map(to_xy, (a, b, p))
+    AB = B - A
+    if np.allclose(AB, 0):
+        Q = A
+    else:
+        t = np.clip(np.dot(P - A, AB) / np.dot(AB, AB), 0.0, 1.0)
+        Q = A + t*AB
+    # back to lon/lat
+    xq, yq = Q
+    lon = p[0] + (xq / (R * cos(lat0)))
+    lat = p[1] + (yq / R)
+    return (lon, lat)
+
+def cap_deviation_local(smoothed: np.ndarray, raw: np.ndarray, max_dev_m: float, window: int = 25) -> np.ndarray:
+    if not (max_dev_m and max_dev_m > 0) or len(raw) < 2 or len(smoothed) < 3:
+        return smoothed
+    out = smoothed.copy()
+    out[0]  = raw[0]
+    out[-1] = raw[-1]
+    j = 0  # segment cursor on raw polyline
+    lat0 = radians(raw[0][1])
+    max_dev2 = max_dev_m * max_dev_m
+    for i in range(1, len(out)-1):
+        p = tuple(out[i])
+        best_q, best_d2, best_seg = None, float("inf"), j
+        lo = max(0, j - window)
+        hi = min(len(raw) - 2, j + window)
+        for k in range(lo, hi + 1):
+            q = closest_point_on_segment_fast(tuple(raw[k]), tuple(raw[k+1]), p)
+            d2 = equirect_m2(p, q, lat0)
+            if d2 < best_d2:
+                best_d2, best_q, best_seg = d2, q, k
+                if best_d2 <= max_dev2:
+                    break
+        j = best_seg  # advance cursor along the path
+        if best_d2 > max_dev2:
+            d = math.sqrt(best_d2)
+            alpha = (d - max_dev_m) / d
+            out[i] = ((1 - alpha)*p[0] + alpha*best_q[0],
+                      (1 - alpha)*p[1] + alpha*best_q[1])
+    return out
 
 
-tab1, tab2 = st.tabs(["gaps", "shortest_path"])
+RES = 11
 
-with tab1:
-    missing_path = hexagons_dataframe_to_geojson(missing_hexes, file_output=None, column_name="hex_id")
-    valid_path = hexagons_dataframe_to_geojson(valid_path, file_output=None, column_name="hex_id")
+def _h3f():
+    f = {}
+    if hasattr(h3, "geo_to_h3"):  # v3
+        f["latlon_to_cell"] = lambda lat, lon, res: h3.geo_to_h3(lat, lon, res)
+        f["cell_to_latlon"] = lambda cell: h3.h3_to_geo(cell)  # (lat,lon)
+    else:  # v4
+        f["latlon_to_cell"] = lambda lat, lon, res: h3.latlng_to_cell(lat, lon, res)
+        f["cell_to_latlon"] = lambda cell: h3.cell_to_latlng(cell)  # (lat,lon)
+    return f
 
-    m = folium.Map(location=[15.70, 114.94], zoom_start=4, tiles="CartoDB positron")
-    geo_j = folium.GeoJson(data=missing_path, style_function=lambda x: {"fillColor": "orange", "fillOpacity": 1})
-    geo_j.add_to(m)
-    geo_j = folium.GeoJson(data=valid_path, style_function=lambda x: {"fillColor": "blue", "fillOpacity": 1})
-    geo_j.add_to(m)
+H3F = _h3f()
 
-    st.write('The shortest path algorithm can be used to fill in gaps in AIS trajectories. Positional data can be inconsistent in certain geographic regions. Below is an example vessel path with gaps filled in.')
-    example_data = folium_static(m)
+# --- Smoothing (SciPy optional) ---
+try:
+    from scipy.interpolate import splprep, splev
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+def chaikin(points: np.ndarray, iters: int = 2) -> np.ndarray:
+    pts = points.copy()
+    for _ in range(iters):
+        new_pts = [pts[0]]
+        for i in range(len(pts)-1):
+            p, q = pts[i], pts[i+1]
+            Q = 0.75*p + 0.25*q
+            R = 0.25*p + 0.75*q
+            new_pts.extend([Q, R])
+        new_pts.append(pts[-1])
+        pts = np.vstack(new_pts)
+    return pts
+
+def spline(points: np.ndarray, s: float = 0.0, num: int = 400) -> np.ndarray:
+    if not HAVE_SCIPY or len(points) < 3:
+        return points
+    x, y = points[:,0], points[:,1]
+    d = np.r_[0, np.cumsum(np.hypot(np.diff(x), np.diff(y)))]
+    if d[-1] == 0:
+        return points
+    u = d / d[-1]
+    try:
+        tck, _ = splprep([x, y], u=u, s=s, k=min(2, len(points)-1))  # k=2, s≈0
+        uu = np.linspace(0, 1, num)
+        xs, ys = splev(uu, tck)
+        return np.column_stack([xs, ys])
+    except Exception:
+        return points
 
 
-#mylist = shortest_path("833849fffffffff", "83318dfffffffff")
-with tab2:
+# ---------- API models ----------
+class Point(BaseModel):
+    lat: confloat(ge=-90, le=90)
+    lon: confloat(ge=-180, le=180)
 
-    st.write('Choose two maritime hexagons at resolution 3 to find their shortest maritime path')
-   
+class RouteReq(BaseModel):
+    start: Point
+    end: Point
+    smooth: bool = True
+    method: str = Field("spline", description="spline|chaikin")
+    s: confloat(ge=0.0, le=10.0) = 0.0      # hug the path
+    npts: conint(ge=50, le=2000) = 400
+    iters: conint(ge=1, le=6) = 1
+    max_dev_m: Optional[confloat(ge=0.0)] = 5.0   # really tight leash
 
-    form = st.form(key='my-form')
-    from_hex = form.text_input('Enter origin hex id', value='833849fffffffff')
-    to_hex = form.text_input('Enter destination hex id', value='83318dfffffffff')
-    submit = form.form_submit_button('Submit')
 
-    if submit:
+app = FastAPI(title="H3+Neo4j Route API", version="1.0")
 
-        try: 
-            res = shortest_path(f'{from_hex}', f'{to_hex}')
+# ---------- Neo4j driver ----------
+NEO4J_URI  = os.getenv("NEO4J_URI", "bolt://neo4j:7687")   # inside compose use bolt://neo4j:7687
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
-            # #df = pd.DataFrame(res)
-            # # df.to_csv('shortest_path_dijkstra.csv', index=False)
+def _wait_for_neo4j(timeout=120):
+    import time
+    start = time.time()
+    while True:
+        try:
+            with driver.session() as s:
+                s.run("RETURN 1").single()
+            return
+        except ServiceUnavailable:
+            if time.time() - start > timeout:
+                raise
+            time.sleep(2)
 
-            if res:
+@app.on_event("startup")
+def _startup():
+    _wait_for_neo4j()
 
-                test = hexagons_dataframe_to_geojson(res, file_output=None, column_name="hex_id")
-                p = folium.Map(location=[15, 80], zoom_start=3, tiles="CartoDB positron")
-                geo_j = folium.GeoJson(data=test, style_function=lambda x: {"fillColor": "orange"})
-                geo_j.add_to(p)
+@app.get("/healthz")
+def healthz():
+    try:
+        with driver.session() as s:
+            s.run("RETURN 1").single()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-                st_data = folium_static(p)
-                
-                st.write('Shortest path (H3 list)')
-                st.write(res)
-                st.write(st_data)
+# ---------- core helpers ----------
+def h3_centroid_line(cells: List[str]) -> np.ndarray:
+    # (lon, lat) for GeoJSON
+    return np.array([(H3F["cell_to_latlon"](c)[1], H3F["cell_to_latlon"](c)[0]) for c in cells], dtype=float)
 
-        except:
-            pass
+def geojson_line(coords: np.ndarray, props: dict):
+    return {
+        "type": "Feature",
+        "properties": props,
+        "geometry": {"type": "LineString", "coordinates": coords.tolist()},
+    }
 
-driver.close()
+def shortest_path_hexes(from_hex: str, to_hex: str) -> List[str]:
+    """
+    Use GDS Dijkstra on pre-projected 'myGraph'.
+    Same shape as your previously working query:
+      - nodeLabels:['H3']
+      - relationshipTypes:['CAN_PASS']
+      - sourceNode: source  (matched by hex_name)
+      - targetNode: target
+    Returns the ordered list of H3 hex_name along the path (or [] if none).
+    """
+    cypher = """
+    MATCH (source:H3 {hex_name: $from_hex}), (target:H3 {hex_name: $to_hex})
+    CALL gds.shortestPath.dijkstra.stream('myGraph', {
+      nodeLabels: ['H3'],
+      relationshipTypes: ['CAN_PASS'],
+      relationshipWeightProperty: 'cost',
+      sourceNode: source,
+      targetNode: target
+    })
+    YIELD path, nodeIds
+    RETURN [nodeId IN nodeIds | gds.util.asNode(nodeId).hex_name] AS nodeNames
+    """
+    with driver.session() as sess:
+        rec = sess.run(cypher, parameters={"from_hex": from_hex, "to_hex": to_hex}).single()
+        if not rec or rec.get("nodeNames") is None:
+            return []
+        return rec["nodeNames"]
+
+
+def latlon_to_hex(lat: float, lon: float) -> str:
+    return H3F["latlon_to_cell"](lat, lon, RES)
+
+# ---------- endpoint ----------
+@app.post("/route")
+def route(req: RouteReq):
+    # 1) start/end hex at requested res
+    from_hex = latlon_to_hex(req.start.lat, req.start.lon)
+    to_hex   = latlon_to_hex(req.end.lat,   req.end.lon)
+
+        # log them
+    logger.info(f"/route start_hex={from_hex} end_hex={to_hex} "
+                f"start=({req.start.lat:.6f},{req.start.lon:.6f}) "
+                f"end=({req.end.lat:.6f},{req.end.lon:.6f}) res={RES}")
+
+    # 2) ask Neo4j GDS for path over CAN_PASS
+    hexes = shortest_path_hexes(from_hex, to_hex)
+    if not hexes:
+        raise HTTPException(404, detail="No path found in graph for given start/end at this resolution.")
+
+    # 3) centroids -> LineStrings (raw + smoothed)
+    raw = h3_centroid_line(hexes)
+
+    if req.smooth:
+        if req.method == "spline":
+            smooth = spline(raw, s=req.s, num=req.npts)
+        else:
+            smooth = chaikin(raw, iters=req.iters)
+        smooth = cap_deviation_local(smooth, raw, req.max_dev_m, window=25)
+    else:
+        smooth = raw
+
+
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            geojson_line(raw, {"kind": "raw_centroids", "res": RES, "n": len(hexes)}),
+            geojson_line(smooth, {"kind": "smoothed", "method": req.method})
+        ]
+    }
+    return fc
