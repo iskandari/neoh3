@@ -1,141 +1,139 @@
-import h3
-from neo4j import GraphDatabase, Session
-from neo4j.exceptions import ConstraintError
-import time
+import csv
 import logging
+import time
+from itertools import islice
+from neo4j import GraphDatabase
+from neo4j.exceptions import ServiceUnavailable
+import os
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# --- CONFIG ---
+# If running this script on the HOST, use localhost; inside docker network, use 'neo4j'
 logging.basicConfig(level=logging.INFO)
 
-uri = "neo4j://neo4j:7687"
-driver = GraphDatabase.driver(uri, auth=("neo4j", "password"))
+NEO4J_URI  = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
-  # close the driver object
+DISTINCT_PATH = "data/distinct_h3_hexes.csv"      # no header, rows: idx,h3
+MAZE_PATH     = "data/hex_maze.csv"               # no header, rows: src_idx,dst_idx,cost
+BATCH_NODES   = 50_000
+BATCH_EDGES   = 50_000
+
+def wait_for_neo4j(timeout=120):
+    start = time.time()
+    while True:
+        try:
+            with driver.session() as s:
+                s.run("RETURN 1").single()
+            logging.info("Neo4j is reachable.")
+            return
+        except ServiceUnavailable:
+            if time.time() - start > timeout:
+                raise
+            logging.info("Waiting for Neo4j to come up...")
+            time.sleep(2)
+
+def chunked(reader, size):
+    while True:
+        block = list(islice(reader, size))
+        if not block:
+            break
+        yield block
 
 def prepare_hexes():
-    logging.info("Preparing hexes")
-
     with driver.session() as sess:
-        result = sess.run(
-            """
-                MATCH (n:H3) RETURN count(n) AS c
-        """
-        )
-        req = int(result.single()["c"])
-        logging.debug(f"Number of H3 nodes:{req}")
+        # 0) Constraints & indexes FIRST
+        logging.info("Creating constraints / indexes (if not exists)")
+        sess.run("CREATE CONSTRAINT h3_id IF NOT EXISTS FOR (h:H3) REQUIRE h.id IS UNIQUE")
+        sess.run("""
+            CREATE INDEX h3_hex_name IF NOT EXISTS
+            FOR (h:H3) ON (h.hex_name)
+        """)
 
-    if req == 31488:  # Then H3 nodes are already created
-        logging.info('H3 nodes have been created already.')
-        return
-
-    logging.info('H3 nodes are being created.')
-
-    with open("data/distinct_h3_hexes.csv") as distinct_h3_hexes:
-        distinct_hexes_lines = distinct_h3_hexes.readlines()
-        sep = None
-        for x in [",", "\t", ";", "|"]:
-            if x in distinct_hexes_lines[0]:
-                sep = x
-        if sep is not None:
-            id = [line.split(sep=sep)[0].replace("\n", "")
-                  for line in distinct_hexes_lines]
-            hex = [line.split(sep=sep)[1].replace("\n", "")
-                   for line in distinct_hexes_lines]
-        else:
-            logging.error("Separator not found - 1")
-
-    distinct_hexes = [
-        {'id': int(id[i]), 'hex': hex[i]} for i in range(len(id))
-    ]  # List of dict [{'id': id, 'hex': hex}, {...}, ...]
-    with driver.session() as sess:
-
-        # Query to create all nodes
-        node_create_query = """
-                UNWIND $distinct_h3 as h3
-                CALL apoc.create.node(["H3"], {id: h3['id'], hex_name:h3['hex']})
-                YIELD node
-                RETURN node;"""
-        sess.run(node_create_query, distinct_h3=distinct_hexes)
-
-        # This query creates a constraint on distinct h3 IDs.
-        sess.run(
-            """
-            CREATE CONSTRAINT H3_id IF NOT EXISTS on (n:H3) ASSERT n.id IS UNIQUE
-            """
-        )
-
-        # Create index on the hex name for faster search
-        sess.run(
-            """
-            CREATE INDEX H3_hex_hame IF NOT EXISTS
-            FOR (h:H3)
-            ON (h.hex_name)
-            """
-        )
-
-    logging.info('All nodes created')
-    del distinct_hexes
-    with open("data/hex_maze.csv") as hex_maze:
-        hex_maze_lines = hex_maze.readlines()
-        sep = None
-        for x in [",", "\t", ";", "|"]:
-            if x in hex_maze_lines[0]:
-                sep = x
-        if sep is not None:
-            srcs = [int(line.split(sep=",")[0].replace("\n", ""))
-                    for line in hex_maze_lines]
-            dsts = [int(line.split(sep=",")[1].replace("\n", ""))
-                    for line in hex_maze_lines]
-            cost = [int(line.split(sep=",")[2].replace("\n", ""))
-                    for line in hex_maze_lines]
-        else:
-            logging.error("Separator not found - 2")
-
-    h3_maze = [
-        {'from': srcs[i], 'to': dsts[i], 'cost': cost[i]} for i in range(len(srcs))
-    ]  # List of dictionaries: [{"from": source, "to": destination, "cost": cost}, {...}, ...]
-    with driver.session() as sess:
+        # 1) Nodes
         start = time.monotonic()
-        logging.info("Relations are being created")
+        current_nodes = sess.run("MATCH (n:H3) RETURN count(n) AS c").single()["c"]
+        logging.info(f"Existing H3 nodes: {current_nodes}")
 
-        # Query to create relations between nodes
-        query = """
-                UNWIND $h3_maze as h3_path
-                MATCH (src:H3 {id:h3_path["from"]})
-                MATCH (dst:H3 {id:h3_path["to"]})
-                CALL apoc.create.relationship(src, "CAN_PASS", {cost: h3_path["cost"]}, dst)
-                YIELD rel
-                RETURN count(*)
-        """
+        if current_nodes == 0:
+            logging.info("Loading nodes from distinct_h3_hexes.csv ...")
+            with open(DISTINCT_PATH, newline="") as f:
+                rdr = csv.reader(f)
+                total = 0
+                for block in chunked(rdr, BATCH_NODES):
+                    # block entries: [idx, h3]
+                    records = [{"id": int(r[0]), "hex": r[1]} for r in block if len(r) >= 2]
+                    sess.run(
+                        """
+                        UNWIND $batch AS row
+                        MERGE (h:H3 {id: row.id})
+                        ON CREATE SET h.hex_name = row.hex
+                        """,
+                        batch=records
+                    )
+                    total += len(records)
+                    logging.info(f"Nodes committed: {total:,}")
+            logging.info(f"Nodes loaded in {time.monotonic() - start:.2f}s")
+        else:
+            logging.info("Nodes already present. Skipping node load.")
 
-        rslt = sess.run(query, h3_maze=h3_maze)
+        # 2) Relationships (chunked)
+        logging.info("Loading relationships (CAN_PASS) from hex_maze.csv ...")
+        start = time.monotonic()
+        inserted = 0
+        with open(MAZE_PATH, newline="") as f:
+            rdr = csv.reader(f)
+            for block in chunked(rdr, BATCH_EDGES):
+                rows = []
+                for r in block:
+                    if len(r) < 3:
+                        continue
+                    try:
+                        rows.append({"src": int(r[0]), "dst": int(r[1]), "cost": int(r[2])})
+                    except ValueError:
+                        continue
+                if not rows:
+                    continue
+                # MERGE nodes on-the-fly to guarantee endpoints exist (id is unique)
+                sess.run(
+                    """
+                    UNWIND $batch AS row
+                    MERGE (a:H3 {id: row.src})
+                    MERGE (b:H3 {id: row.dst})
+                    MERGE (a)-[:CAN_PASS {cost: row.cost}]->(b)
+                    """,
+                    batch=rows
+                )
+                inserted += len(rows)
+                logging.info(f"Relationships committed: {inserted:,}")
 
-        logging.info(
-            f'{rslt.single()["count(*)"]} relations were created in {round((time.monotonic() - start), 2)} seconds')
-   
-    with driver.session() as sess:
-        
-        query_string = f"""
-        CALL gds.graph.project(
-        'myGraph',
-        'H3',
-        'CAN_PASS',
-        {{
-            relationshipProperties: 'cost'
-        }}
-        )
-        """
+        rel_count = sess.run("MATCH ()-[r:CAN_PASS]->() RETURN count(r) AS c").single()["c"]
+        logging.info(f"Total relationships in DB: {rel_count:,} (loaded {inserted:,} this run) in {time.monotonic() - start:.2f}s")
 
+        # 3) (Optional) GDS projection
         try:
-            sess.run(query_string)
-            logging.info('Creating graph')
+            sess.run("CALL gds.graph.drop('myGraph', false) YIELD graphName")
+        except Exception:
+            pass
+        try:
+            sess.run("""
+                CALL gds.graph.project(
+                  'myGraph',
+                  'H3',
+                  { CAN_PASS: { type: 'CAN_PASS', properties: 'cost' } }
+                )
+            """)
+            logging.info("GDS graph 'myGraph' projected.")
         except Exception as e:
-            logging.info(e)
+            logging.info(f"GDS projection skipped/failed: {e}")
 
-
-driver.close()
-
-if __name__ == "__main__":
+def main():
+    wait_for_neo4j()
     prepare_hexes()
 
-
-
+if __name__ == "__main__":
+    main()
+    driver.close()

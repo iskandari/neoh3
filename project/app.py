@@ -55,7 +55,7 @@ class Neo4jConnection:
         return response
 
 
-def hexagons_dataframe_to_geojson(hex_list: list, file_output = None, column_name = "value"):
+def hexagons_dataframe_to_geojson(hex_list: list, column_name = "value"):
     """
     Produce the GeoJSON for a dataframe, constructing the geometry from the "hex_id" column
     and with a property matching the one in column_name

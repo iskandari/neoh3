@@ -1,40 +1,40 @@
 FROM python:3.10-slim
 
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# set work directory
 WORKDIR /usr/src/app
 
-# set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+# System deps (no software-properties-common needed)
+# - build-essential for wheels that need compiling
+# - GEOS/PROJ/GDAL for GeoPandas/Fiona/Rasterio stack if you use them
+# - libpq5 if you talk to Postgres
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      gcc \
+      g++ \
+      curl \
+      ca-certificates \
+      libgeos-dev \
+      proj-bin \
+      libproj-dev \
+      gdal-bin \
+      libgdal-dev \
+      unixodbc-dev \
+      libpq5 \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apt update && apt install -y software-properties-common
-RUN apt update && apt install -y \
-            gcc \ 
-            libgeos-dev \
-            unixodbc-dev \
-            g++ \
-            python3-gdal \
-            libgdal-dev \
-            libpq5
-            
-
-RUN export CPLUS_INCLUDE_PATH=/usr/include/gdal
-RUN export C_INCLUDE_PATH=/usr/include/gdal
-RUN export LDFLAGS="-L/usr/local/opt/zlib/lib"
-RUN export CPPFLAGS="-I/usr/local/opt/zlib/include"
-
-# virtualenv
+# Create venv
 ENV VIRTUAL_ENV=/opt/venv
-RUN python3 -m venv $VIRTUAL_ENV
+RUN python -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# install dependencies
-RUN pip install --upgrade pip
-COPY ./requirements.txt .
-RUN pip install -r requirements.txt
+# Python deps
+COPY requirements.txt .
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install -r requirements.txt
 
-
-# copy project
+# App
 COPY . .
-CMD [ "python", "./main.py"]
+CMD ["python", "./main.py"]
